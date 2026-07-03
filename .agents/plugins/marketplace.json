@@ -1,0 +1,20 @@
+{
+  "name": "sukhrob-codex-plugins",
+  "interface": {
+    "displayName": "Sukhrob's Codex Plugins"
+  },
+  "plugins": [
+    {
+      "name": "jobpilot",
+      "source": {
+        "source": "local",
+        "path": "./plugins/jobpilot"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
