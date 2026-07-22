@@ -15,11 +15,8 @@ User approves once up front. No per-job confirmation after that.
 
 ## Setup
 
-Follow `../../shared/setup.md` to load profile, resume, credentials.
-
-```bash
-JOBPILOT_API="${JOBPILOT_API:-https://jobpilot.suxrobgm.net}"
-```
+Follow `../../shared/setup.md` to load profile, resume, credentials. Shared campaign mechanics
+(applied-check, result writes, worker input, rules) live in `../../shared/campaign-flow.md`.
 
 Read `autoApply` for config (defaults applied per field):
 
@@ -65,14 +62,9 @@ Ask: **"Want me to proceed with the application?"** - `yes`/`go` continue, anyth
 
 ### 1.2 Dedupe Check
 
-```bash
-URL_ENCODED=$(jq -rn --arg v "<job-url>" '$v|@uri')
-TITLE_ENCODED=$(jq -rn --arg v "<title>" '$v|@uri')
-COMPANY_ENCODED=$(jq -rn --arg v "<company>" '$v|@uri')
-curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/applied/check?url=$URL_ENCODED&title=$TITLE_ENCODED&company=$COMPANY_ENCODED"
-```
-
-If `.applied === true`, surface the match (title + company + appliedAt + `.match.kind`) and ask whether to proceed anyway. Stop on no.
+Run the applied-check (`../../shared/campaign-flow.md`) with url + title + company. If
+`.applied === true`, surface the match (title + company + appliedAt + `.match.kind`) and ask
+whether to proceed anyway. Stop on no.
 
 ### 1.3 Create Campaign-of-1
 
@@ -116,7 +108,8 @@ curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/queu
 ```bash
 CAMPAIGN=$(curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" -X POST "$JOBPILOT_API/api/campaigns" \
   -H 'content-type: application/json' \
-  -d '{"query":"apply queue","source":"apply","config":{"minScore":6,"maxApplications":10}}')
+  -d "$(jq -n --argjson minScore <minMatchScore> \
+    '{query:"apply queue", source:"apply", config:{minScore:$minScore, maxApplications:10}}')")
 CAMPAIGN_ID=$(echo "$CAMPAIGN" | jq -r '.campaignId')
 ```
 
@@ -126,12 +119,9 @@ For each queue URL:
 
 ### 3.1 Pre-dedupe (no tab)
 
-```bash
-URL_ENCODED=$(jq -rn --arg v "<job-url>" '$v|@uri')
-curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/applied/check?url=$URL_ENCODED"
-```
-
-If applied, mark the queue entry consumed, create the Job as `pending`, then POST its `/result` with `outcome:"skipped"`, `skipReason:"Already applied (<kind>)"`; continue without spawning a worker.
+Run the applied-check (`../../shared/campaign-flow.md`) with the URL alone. If applied, mark the
+queue entry consumed and record the default already-applied skip; continue without spawning a
+worker.
 
 ### 3.2 Score (delegate to `job-worker`)
 
@@ -153,7 +143,7 @@ It returns `{ outcome:"scored", jobKey, title, company, location, matchScore, co
 ```
 ## Batch Apply
 
-Visited <total> jobs. <qualified> qualify (score >= minMatchScore/100).
+Visited <total> jobs. <qualified> qualify (score >= minMatchScore, out of 100).
 
 | # | Score  | Title | Company | Location | Board |
 |---|--------|-------|---------|----------|-------|
@@ -186,15 +176,7 @@ curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" -X PATCH "$JOBPILOT_API
 
 ### 5.2 Apply (delegate to `job-worker`)
 
-Delegate to the `job-worker` subagent and wait for its compact result - it navigates, authenticates, tailors, fills, and submits in its own tab/context (keeping the form snapshots out of this conversation). One worker at a time. Input JSON:
-
-```json
-{ "mode": "apply", "campaignId": "<CAMPAIGN_ID>", "jobKey": "<key>", "url": "<job-url>",
-  "board": "<domain>", "resumeId": "<RESUME_ID>", "defaultStartDate": "<autoApply.defaultStartDate>",
-  "salaryExpectation": <remembered-or-null>, "preSubmitReview": <true when config.maxApplications === 1, else false> }
-```
-
-(`digest` omitted → the worker fetches it from the saved Job.)
+Delegate to the `job-worker` subagent and wait for its compact result - it navigates, authenticates, tailors, fills, and submits in its own tab/context (keeping the form snapshots out of this conversation). One worker at a time. Use the apply-mode input from `../../shared/campaign-flow.md` with `digest` omitted (the worker fetches it from the saved Job) and `preSubmitReview: <true when config.maxApplications === 1, else false>`.
 
 **Single-job pre-submit review:** when `preSubmitReview` is true the worker fills everything, leaves the form open, and returns `needs_user category:"review"` with a field summary in `context`. Present:
 
@@ -208,19 +190,9 @@ Delegate to the `job-worker` subagent and wait for its compact result - it navig
 
 ### 5.3 Record Result
 
-Map the worker's `outcome` to `/result` (the worker never writes it). The server atomically updates the Job, creates the Application and initial event on `applied`, and marks the queue; responses derive summaries from current rows.
-
-```bash
-NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# applied
-jq -n --arg t "$NOW" --argjson score <0-100> '{outcome:"applied", appliedAt:$t, matchScore:$score}'
-# failed
-jq -n --arg r "<failReason>" --arg notes "<retryNotes>" '{outcome:"failed", failReason:$r, retryNotes:$notes}'
-# skipped (e.g. CAPTCHA, user cancelled, max-apps cap)
-jq -n --arg r "<skipReason>" '{outcome:"skipped", skipReason:$r}'
-```
-
-`needs_user`: `category:"salary"` (no profile salary preference matched) → ask once, remember for the campaign, re-delegate 5.2 with `salaryExpectation`; `category:"verification"` → pause and ask; `category:"payment"` → POST `/result` `failed` `"Payment required"`. The worker closed its tabs; re-select tab 0, then continue.
+Map the worker's `outcome` to a terminal `/result` write and route `needs_user` per
+`../../shared/campaign-flow.md` (the worker never writes results itself; on `salary`,
+re-delegate 5.2 with `salaryExpectation` set).
 
 ### 5.4 Limit
 
@@ -238,11 +210,6 @@ Print a summary table and link to `$JOBPILOT_WEB/campaigns/<CAMPAIGN_ID>`.
 
 ## Rules
 
+The shared campaign rules (`../../shared/campaign-flow.md`) apply throughout. On top of them:
+
 1. **Up-front confirmation mandatory** (1.1 or Phase 4); single-job mode adds pre-submit review (5.2).
-2. **Create accounts when needed** - the `job-worker` follows `../../shared/auth.md`: register when no account exists (without asking), run forgot-password when the stored password is stale.
-3. **Never process payments** - on `needs_user category:"payment"`, POST `/result` `outcome:"failed"`, `failReason:"Payment required"`.
-4. **CAPTCHAs / email verification** - the worker attempts `solve-captcha` and returns `skipped` when unsolved; for `needs_user category:"verification"`, pause and ask (see `../../shared/auth.md`).
-5. **Be honest about match scores.**
-6. **Pace** 3-5s between submissions on the same domain.
-7. **The Campaign is the audit trail.** PATCH non-terminal transitions; POST `/result` for terminal outcomes.
-8. **Never skip silently.** Every `skipped` write carries a non-empty `skipReason`. No valid reason → not a skip.

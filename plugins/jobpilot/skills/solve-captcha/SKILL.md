@@ -1,16 +1,12 @@
 ---
 name: solve-captcha
-description: Solve a CAPTCHA on the current browser tab. Free path first - frictionless checkbox + distorted-text via your own vision; image challenges (reCAPTCHA / hCaptcha / Turnstile) go to a configured token service (2captcha / CapSolver). Returns solved / unsolved for the caller to fall back.
+description: Solve a CAPTCHA on the current browser tab - free checkbox/text paths first, then a configured token service for image challenges. Returns solved or unsolved for the caller to fall back.
 argument-hint: "[url | ref_or_description] (optional; a URL → navigate there first; omit → auto-detect)"
 ---
 
 # Solve CAPTCHA
 
-Clear a CAPTCHA on the **current browser tab**. Return **solved** or **unsolved** (the caller falls back). Authorized use only - the user's own applications.
-
-```bash
-JOBPILOT_API="${JOBPILOT_API:-https://jobpilot.suxrobgm.net}"
-```
+Clear a CAPTCHA on the **current browser tab**. Return **solved** or **unsolved** (the caller falls back). Authorized use only - the user's own applications. `$JOBPILOT_API` / `$JOBPILOT_API_TOKEN` are injected by the terminal host.
 
 ## 1. Dispatch + identify
 

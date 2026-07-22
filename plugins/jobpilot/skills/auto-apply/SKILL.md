@@ -1,7 +1,7 @@
 ---
 name: auto-apply
 description: Search a job board and autonomously apply to matching jobs one at a time, until paused, exhausted, or the max-applications cap is hit.
-argument-hint: "<search_query --board <domain> [--min-score N] [--max-apps N]> OR 'resume' OR 'retry-failed <campaign-id>'"
+argument-hint: "<query> --board <domain> [--min-score N] [--max-apps N] | resume | retry-failed <campaign-id>"
 ---
 
 # Auto-apply - Search + Apply On Demand
@@ -10,11 +10,8 @@ Keep the chosen board open in tab 1; for each result that qualifies, delegate th
 
 ## Setup
 
-```bash
-JOBPILOT_API="${JOBPILOT_API:-https://jobpilot.suxrobgm.net}"
-```
-
-Follow `../../shared/setup.md`. Read `autoApply` (defaults applied per field):
+Follow `../../shared/setup.md`. Shared campaign mechanics (applied-check, result writes, worker
+input, rules) live in `../../shared/campaign-flow.md`. Read `autoApply` (defaults applied per field):
 
 | Setting                      | Default            | Notes                                                                                     |
 | ---------------------------- | ------------------ | ----------------------------------------------------------------------------------------- |
@@ -41,7 +38,7 @@ curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/camp
 
 Each response is paginated; inspect its `.items` array.
 
-If any matches, ask **"Found an incomplete campaign from `<startedAt>` (status: `<status>`). Resume or start fresh?"** Resume → inject the `resume` skill with that `campaignId`.
+If any matches, ask **"Found an incomplete campaign from `<startedAt>` (status: `<status>`). Resume or start fresh?"** Resume → inject the `resume-campaign` skill with that `campaignId`.
 
 Otherwise the web UI already created the campaign row when the user submitted `/campaigns/new` - confirm it exists and use that `campaignId`. Capture its selected base resume: `RESUME_ID=$(curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/campaigns/$CAMPAIGN_ID" | jq -r '.config.resumeId // ""')` (empty → fall back to the primary downstream). If invoked manually (rare), create one:
 
@@ -78,24 +75,17 @@ If no row matches, command the campaign to `failed` with `POST /api/campaigns/$C
 1. `browser_navigate` to `searchUrl` (this is **tab 1** - keep it open for the whole campaign).
 2. Follow `../../shared/auth.md` - logs in, and **registers a new account when none exists, without asking**.
 3. Fill the search fields and submit.
-4. Take a `browser_snapshot` narrowed to the results list (per `../../shared/browser-tips.md`) to read `{ title, company, location, url }` per row. This is one viewport - scroll/paginate per **Pagination & infinite scroll** in `../../shared/browser-tips.md` as the loop drains rows (see 2.5); never treat the first batch as all jobs.
+4. Take a `browser_snapshot` narrowed to the results list (per `../../shared/browser-tips.md`) to read `{ title, company, location, url }` per row. This is one viewport - scroll/paginate per **Pagination & infinite scroll** in `../../shared/browser-tips.md` as the loop drains rows (see **Stop Conditions**); never treat the first batch as all jobs.
 
 ## Phase 2: Apply Loop (on demand)
 
-Walk the tab-1 results top to bottom; at the last loaded row, scroll/page for more (1.2 step 4) before concluding. For each result:
+Walk the tab-1 results top to bottom; at the last loaded row, scroll/page for more (per **Pagination & infinite scroll** in `../../shared/browser-tips.md`) before concluding. For each result:
 
 ### 2.1 Pre-filter (no tab)
 
-Dedupe in-board by normalized title+company. Then check previously-applied:
-
-```bash
-URL_ENCODED=$(jq -rn --arg v "<job-url>" '$v|@uri')
-TITLE_ENCODED=$(jq -rn --arg v "<title>" '$v|@uri')
-COMPANY_ENCODED=$(jq -rn --arg v "<company>" '$v|@uri')
-curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" "$JOBPILOT_API/api/applied/check?url=$URL_ENCODED&title=$TITLE_ENCODED&company=$COMPANY_ENCODED"
-```
-
-If `.applied`, create the job as `pending`, then POST its `/result` with `outcome:"skipped"`, `skipReason:"Already applied (<kind>)"`, and move on - **don't open a tab.**
+Dedupe in-board by normalized title+company, then run the applied-check
+(`../../shared/campaign-flow.md`). If `.applied`, record the default already-applied skip and
+move on - **don't open a tab.**
 
 ### 2.2 Score
 
@@ -110,14 +100,21 @@ SCORE=$(echo "$FIT" | jq -r '.score')
 CONF=$(echo "$FIT" | jq -r '.confidence')
 ```
 
-If `CONF >= 0.7` and `SCORE` is at least 10 points from `minMatchScore` on either side, use it directly; otherwise rescore using `strongMatches`/`partialMatches`/`gaps`. A thin/generic row is **not** a skip. When a full posting read is genuinely needed, delegate the row to `job-worker` `mode:"score"` (`{campaignId:$CAMPAIGN_ID, jobKey:<key>, url, resumeId:$RESUME_ID, minMatchScore:$MIN_SCORE}`) instead of opening the posting in this conversation. The worker creates every row non-terminal, then sends ineligible outcomes to `/result`; eligible rows remain `pending`. PATCH an eligible row to `applying`, then go straight to apply (2.3).
+Branch on the result (eligibility per `../../shared/eligibility.md` - a thin/generic row is **not** a skip):
+
+- **Confident** - `CONF >= 0.7` and `SCORE` at least 10 points from `minMatchScore` on either side → use the score directly.
+- **Uncertain** → rescore yourself from `strongMatches`/`partialMatches`/`gaps`.
+- **Needs the full posting** → delegate the row to `job-worker` `mode:"score"` (`{campaignId:$CAMPAIGN_ID, jobKey:<key>, url, resumeId:$RESUME_ID, minMatchScore:$MIN_SCORE}`) instead of opening the posting in this conversation. The worker creates every row non-terminal and sends ineligible outcomes to `/result`; eligible rows remain `pending`. PATCH an eligible row to `applying`, then go straight to apply (2.3):
 
 ```bash
 curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" -X PATCH "$JOBPILOT_API/api/campaigns/$CAMPAIGN_ID/jobs/<key>" \
   -H 'content-type: application/json' -d '{"status":"applying"}'
 ```
 
-Otherwise (scoreable from the listing/tab-1 snapshot alone): below `minMatchScore` after a fair read → create as `pending`, POST `/result` with `outcome:"skipped"`, `skipReason:"Below minimum match score ($SCORE < $MIN_SCORE)"`, and move on (no tab). Otherwise add it as `applying` and apply (2.3):
+With a usable score from the listing/tab-1 snapshot alone:
+
+- **Below `minMatchScore` after a fair read** → create as `pending`, POST `/result` with `outcome:"skipped"`, `skipReason:"Below minimum match score ($SCORE < $MIN_SCORE)"`, and move on (no tab).
+- **Qualifies** → add it as `applying` and apply (2.3):
 
 ```bash
 DIGEST=<stringified digest>
@@ -129,44 +126,25 @@ curl -fsS -H "authorization: Bearer $JOBPILOT_API_TOKEN" -X POST "$JOBPILOT_API/
     '{key:$key, title:$title, company:$company, location:$location, url:$url, board:$board, matchScore:$score, matchReason:$matchReason, status:"applying", digest:$digest, description:$desc}')"
 ```
 
-### 2.2a Eligibility - what is (and isn't) a skip
-
-Follow `../../shared/eligibility.md`.
-
 ### 2.3 Apply (delegate to `job-worker`)
 
 Hand the job to the `job-worker` subagent and wait for its compact result. It opens its own tab and runs auth, CAPTCHA, tailoring, form-fill, and submit in isolated context, so the form/posting snapshots never enter this conversation. **One worker at a time** - the browser is shared; never delegate the next job until this one returns.
 
-Delegate with input JSON:
-
-```json
-{ "mode": "apply", "campaignId": "<CAMPAIGN_ID>", "jobKey": "<key>", "url": "<job-url>",
-  "board": "<domain>", "digest": <DIGEST>, "resumeId": "<RESUME_ID>",
-  "defaultStartDate": "<autoApply.defaultStartDate>", "salaryExpectation": <remembered-or-null>,
-  "preSubmitReview": false }
-```
-
-It returns one of `applied` / `failed` / `skipped` / `needs_user` - handle in 2.4.
+Delegate with the apply-mode input from `../../shared/campaign-flow.md`, passing the `digest`
+built in 2.2 and `preSubmitReview: false`. It returns one of `applied` / `failed` / `skipped` /
+`needs_user` - handle in 2.4.
 
 ### 2.4 Record + Continue
 
-The worker already closed its apply tab(s); re-select tab 0. Map its `outcome` to a terminal write - POST `/api/campaigns/$CAMPAIGN_ID/jobs/<key>/result` (atomically updates the Job, creates the Application and initial event on `applied`, and marks the queue):
+The worker already closed its apply tab(s); re-select tab 0. Map its `outcome` to a terminal
+`/result` write and route `needs_user` per `../../shared/campaign-flow.md`, with these
+campaign-loop specifics:
 
-```bash
-NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# applied
-jq -n --arg t "$NOW" --argjson score <0-100> '{outcome:"applied", appliedAt:$t, matchScore:$score}'
-# skipped (e.g. CAPTCHA - leave for manual apply via the apply skill)
-jq -n --arg r "<skipReason>" '{outcome:"skipped", skipReason:$r}'
-# failed (login failure, unexpected page, validation, crash)
-jq -n --arg r "<failReason>" --arg notes "<retryNotes>" '{outcome:"failed", failReason:$r, retryNotes:$notes}'
-```
-
-`needs_user` (route by `category`):
-
-- `category:"salary"` (no profile salary preference matched) → ask the user once, remember the answer for the campaign, and re-delegate 2.3 with `salaryExpectation` set.
-- `category:"verification"` → command the campaign to `paused` through `/status` with `{"status":"paused","actor":"agent","reason":"<what's needed, e.g. LinkedIn 2FA>"}`, tell the user what's needed, and exit the loop (the worker left its tab open).
-- `category:"payment"` → never pay: POST `/result` `outcome:"failed"`, `failReason:"Payment required"`, and continue.
+- `salary` → re-delegate 2.3 with `salaryExpectation` set.
+- `verification` → command the campaign to `paused` through `/status` with
+  `{"status":"paused","actor":"agent","reason":"<what's needed, e.g. LinkedIn 2FA>"}`, tell the
+  user what's needed, and exit the loop (the worker left its tab open).
+- `payment` → record the failure and continue with the next result.
 
 Pace 3-5s before the next result.
 
@@ -190,15 +168,9 @@ Print a summary table, link to `$JOBPILOT_WEB/campaigns/<CAMPAIGN_ID>`, suggest 
 
 ## Rules
 
+The shared campaign rules (`../../shared/campaign-flow.md`) apply throughout. On top of them:
+
 1. **Autonomous after launch.** No per-job or batch confirmation; the UI launch is the approval.
-2. **Account handling** - follow `../../shared/auth.md`: register when missing (without asking), forgot-password via the `get-code` skill when stale.
-3. **Never process payments** - POST `/result` `outcome:"failed"`, `failReason:"Payment required"`.
-4. **Email codes** - fetch automatically via the `get-code` skill for `<board-domain>` (see `../../shared/auth.md`); only ask the user when it returns nothing. **2FA** - the worker returns `needs_user category:"verification"`; pause and ask (one-time per board). **CAPTCHA** - never pause: the `job-worker` detects it up front and attempts `solve-captcha`; an unsolved CAPTCHA comes back as a `skipped` outcome (manual apply later), never a pause.
-5. **One job per worker.** Board stays in tab 1; each application runs in the `job-worker`'s own tab, which it closes before returning. Delegate sequentially - one worker at a time (shared browser).
-6. **Deduplicate** within the board and against previously-applied before opening a tab.
-7. **Pace** 3-5s between submissions on the same domain.
-8. **Audit trail.** PATCH non-terminal transitions; POST `/result` for terminal outcomes.
-9. **Respect pause.** Re-read the campaign between jobs; `status === "paused"` → exit cleanly.
-10. **Missing resume file** → command the campaign to `paused` through `/status` with `{"status":"paused","actor":"agent","reason":"Resume file missing"}`, ask the user to re-upload.
-11. **Eligibility** - follow 2.2a. Location/onsite, thin JDs, 1099 work, and below-your-level/seniority are never skip reasons; only a JD-stated citizenship/clearance requirement disqualifies.
-12. **Never skip silently.** Every `skipped` write carries a non-empty `skipReason` (2.2a). No valid reason → not a skip.
+2. **Board stays in tab 1.** Each application runs in the `job-worker`'s own tab, which it closes before returning.
+3. **Respect pause.** Re-read the campaign between jobs; `status === "paused"` → exit cleanly.
+4. **Missing resume file** → command the campaign to `paused` through `/status` with `{"status":"paused","actor":"agent","reason":"Resume file missing"}`, ask the user to re-upload.
